@@ -1,0 +1,91 @@
+name: pi-compute-infinite
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - run: |
+          git config user.name "pi-bot"
+          git config user.email "pi-bot@github.actions"
+          git config --global pull.rebase true
+          git config --global rebase.autoStash true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Compute Pi
+        run: python compute.py
+
+      - name: Archive old shards to Release (B方式)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 設定: リポジトリに残す最大シャード数 (100 = 10億桁)
+          KEEP_SHARDS=100
+          TOTAL_SHARDS=$(ls -1d pi_data/[0-9][0-9][0-9] 2>/dev/null | wc -l)
+          echo "Total shards: $TOTAL_SHARDS, Keep: $KEEP_SHARDS"
+
+          if [ "$TOTAL_SHARDS" -gt "$KEEP_SHARDS" ]; then
+            ARCHIVE_COUNT=$((TOTAL_SHARDS - KEEP_SHARDS))
+            echo "Archiving oldest $ARCHIVE_COUNT shards..."
+            
+            # 一番古いシャードをリスト
+            OLDEST=$(ls -1d pi_data/[0-9][0-9][0-9] | sort | head -n $ARCHIVE_COUNT)
+            FIRST=$(echo "$OLDEST" | head -n1 | xargs basename)
+            LAST=$(echo "$OLDEST" | tail -n1 | xargs basename)
+            
+            TAR_NAME="pi_${FIRST}-${LAST}.tar.gz"
+            echo "Creating $TAR_NAME"
+            tar -czf $TAR_NAME -C pi_data $(echo "$OLDEST" | xargs -n1 basename | tr '\n' ' ')
+            
+            # Release作成 (タグ: pi-000-099 みたいな)
+            TAG="pi-${FIRST}-${LAST}"
+            TOTAL_DIGITS=$(cat pi_data/index.json | jq .total_digits)
+            gh release create "$TAG" "$TAR_NAME" --title "$TAG ($TOTAL_DIGITS digits)" --notes "Digits $FIRST*10M - $LAST*10M, archived to keep repo light" || gh release upload "$TAG" "$TAR_NAME" --clobber
+
+            # リポジトリから削除
+            echo "$OLDEST" | xargs rm -rf
+            rm $TAR_NAME
+            echo "Archived and removed $FIRST to $LAST"
+          else
+            echo "No need to archive yet"
+          fi
+
+      - name: Commit remaining
+        run: |
+          git add pi_data/index.json pi_data/progress.json
+          git add pi_data/[0-9][0-9][0-9]/*.txt 2>/dev/null || true
+          # 削除された古いシャードもコミットに含める
+          git add -A pi_data/
+          git pull --rebase --autostash origin main || true
+          git commit -m "pi: $(cat pi_data/index.json | jq -c .) shards=$(ls -1d pi_data/[0-9][0-9][0-9] 2>/dev/null | wc -l)" || true
+          git push || true
+
+      - name: Trigger next
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python -c "
+          import json,datetime,pathlib
+          p=pathlib.Path('pi_data/progress.json')
+          d=json.loads(p.read_text())
+          d['status']='waiting_next'
+          d['last_updated']=datetime.datetime.now(datetime.timezone.utc).isoformat()
+          p.write_text(json.dumps(d,indent=2))
+          "
+          git add pi_data/progress.json
+          git pull --rebase --autostash origin main || true
+          git commit -m "progress: waiting_next" || true
+          git push || true
+          gh workflow run pi-compute.yml || gh workflow run pi-compute-infinite.yml || true
