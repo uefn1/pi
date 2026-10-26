@@ -15,14 +15,6 @@ URLS = [
 
 def log(m): print(f"[CLI] {m}", flush=True)
 
-def update_progress(**kw):
-    p = DATA_DIR / "progress.json"
-    d = json.loads(p.read_text()) if p.exists() else {}
-    d.update(kw)
-    import datetime
-    d["last_updated"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    p.write_text(json.dumps(d, indent=2, ensure_ascii=False))
-
 def ensure_ycruncher():
     if (YCRUNCHER_DIR / "y-cruncher").exists():
         return
@@ -62,33 +54,25 @@ def main():
     next_total = total + CHUNK_COMPUTE
     log(f"{total:,} -> {next_total:,}")
 
-    # ★重要: 出力は絶対パスではなく、y-cruncherからの相対パスで、存在するディレクトリを指定
-    # y-cruncherは指定したディレクトリに "Pi - 100000000.txt" のようなファイルを作る
+    # 絶対パスで出力ファイルを指定
     abs_data_dir = DATA_DIR.resolve()
-    abs_data_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 一時出力用の空フォルダ
-    tmp_out_dir = abs_data_dir / "_yc_out"
-    tmp_out_dir.mkdir(exist_ok=True)
+    out_file_path = abs_data_dir / f"pi_{next_total}.txt"
+    out_file_path.unlink(missing_ok=True)
 
     os.chdir(YCRUNCHER_DIR)
-    # -o はディレクトリを指定。ファイル名はy-cruncherが決める
-    cmd = ["./y-cruncher","custom","pi", f"-o:{tmp_out_dir}", f"-d:{next_total}", "-b:1G", "--no-wait"]
+    # ★修正: -dec: と -o スペース区切り
+    cmd = ["./y-cruncher", "custom", "pi", f"-dec:{next_total}", "-o", str(out_file_path)]
     log(f"Running: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
     os.chdir("..")
 
-    # 生成されたファイルを探す
-    generated = list(tmp_out_dir.glob("*.txt"))
-    if not generated:
-        generated = list(tmp_out_dir.glob("*Pi*"))
-    if not generated:
-        raise FileNotFoundError(f"y-cruncher output not found in {tmp_out_dir}, listing: {list(tmp_out_dir.iterdir())}")
+    if not out_file_path.exists():
+        # y-cruncherはカレントに作ることがあるので探す
+        candidates = list(YCRUNCHER_DIR.glob("*.txt")) + list(Path(".").glob("*.txt"))
+        if candidates:
+            out_file_path = candidates[0]
     
-    out_file = generated[0]
-    log(f"Found y-cruncher output: {out_file}")
-
-    raw = out_file.read_text()
+    raw = out_file_path.read_text()
     clean = raw.replace("\n","").replace(" ","").replace("\r","")
     if clean.startswith("3."): clean = clean[2:]
     clean = clean[:next_total]
@@ -102,10 +86,9 @@ def main():
         if not dest.exists():
             dest.write_text(clean[i:i+CHUNK_SAVE])
 
-    # 後片付け
-    shutil.rmtree(tmp_out_dir)
+    out_file_path.unlink(missing_ok=True)
     index_file.write_text(json.dumps({"total_digits": next_total}, indent=2))
-    update_progress(total_digits=next_total, status="computed", total_files=next_total//CHUNK_SAVE)
+    log(f"Done {next_total:,}")
 
 if __name__ == "__main__":
     main()
