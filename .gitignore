@@ -1,0 +1,5 @@
+y-cruncher/
+*.tar.gz
+pi_bin
+__pycache__/
+_full.tmp
