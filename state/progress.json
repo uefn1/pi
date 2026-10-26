@@ -1,6 +1,6 @@
 {
-  "total_digits": 800000000,
-  "status": "waiting_next",
-  "total_files": 8000,
-  "last_updated": "2026-10-26T07:33:07.851114+00:00"
+  "total_digits": 900000000,
+  "status": "computed",
+  "total_files": 9000,
+  "last_updated": "2026-10-26T07:37:00.137304+00:00"
 }
