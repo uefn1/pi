@@ -1,74 +1,100 @@
 name: pi-compute-infinite
+
 on:
   workflow_dispatch:
-permissions:
-  contents: write
-  actions: write
+  push:
+    branches: [main]
+    paths:
+      - "state/**"
+
 jobs:
   compute:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+    timeout-minutes: 360
+    permissions:
+      contents: write
 
-      - run: |
-          git config user.name "pi-bot"
-          git config user.email "pi-bot@github.actions"
-          git config --global pull.rebase true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git config
+        run: |
+          git config --global user.name "pi-bot"
+          git config --global user.email "pi-bot@github.com"
           git config --global rebase.autoStash true
 
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Compute Pi
-        run: python compute.py
+      - name: Run compute
+        run: |
+          python compute.py
 
-      - name: Archive old shards to Release (B方式)
+      - name: Archive old shards to Release (keep <5GB)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          KEEP_SHARDS=100
-          TOTAL_SHARDS=$(ls -1d pi_data/[0-9][0-9][0-9] 2>/dev/null | wc -l)
-          echo "Total shards: $TOTAL_SHARDS"
-          if [ "$TOTAL_SHARDS" -gt "$KEEP_SHARDS" ]; then
-            ARCHIVE_COUNT=$((TOTAL_SHARDS - KEEP_SHARDS))
-            OLDEST=$(ls -1d pi_data/[0-9][0-9][0-9] | sort | head -n $ARCHIVE_COUNT)
-            FIRST=$(echo "$OLDEST" | head -n1 | xargs basename)
-            LAST=$(echo "$OLDEST" | tail -n1 | xargs basename)
-            TAR_NAME="pi_${FIRST}-${LAST}.tar.gz"
-            tar -czf $TAR_NAME -C pi_data $(echo "$OLDEST" | xargs -n1 basename | tr '\n' ' ')
-            TAG="pi-${FIRST}-${LAST}"
-            TOTAL_DIGITS=$(cat state/index.json | jq .total_digits)
-            gh release create "$TAG" "$TAR_NAME" --title "$TAG ($TOTAL_DIGITS digits)" --notes "Digits $FIRST*10M - $LAST*10M" || gh release upload "$TAG" "$TAR_NAME" --clobber
-            echo "$OLDEST" | xargs rm -rf
-            rm $TAR_NAME
+          python - << 'PY'
+          from pathlib import Path
+          import json, subprocess, tarfile, os
+          DATA_DIR = Path("pi_data")
+          KEEP_SHARDS = 100  # 100 shards = 1B digits = ~1GB
+          if not DATA_DIR.exists():
+              exit(0)
+          shards = sorted([d for d in DATA_DIR.iterdir() if d.is_dir()])
+          if len(shards) <= KEEP_SHARDS:
+              print(f"Shards {len(shards)} <= {KEEP_SHARDS}, no archive")
+              exit(0)
+          
+          to_archive = shards[:len(shards)-KEEP_SHARDS]
+          print(f"Archiving {len(to_archive)} shards: {[x.name for x in to_archive]}")
+          
+          # Group by 10 shards = 100M digits = 1 tar
+          for i in range(0, len(to_archive), 10):
+              group = to_archive[i:i+10]
+              if not group: continue
+              start = group[0].name
+              end = group[-1].name
+              tar_name = f"pi_{start}-{end}.tar.gz"
+              tar_path = Path(tar_name)
+              if tar_path.exists():
+                  continue
+              print(f"Creating {tar_name}")
+              with tarfile.open(tar_path, "w:gz") as tar:
+                  for g in group:
+                      tar.add(g, arcname=g.name)
+              # Upload to Release
+              tag = "pi-archive"
+              subprocess.run(["gh", "release", "view", tag], check=False)
+              # create release if not exists
+              subprocess.run(["gh", "release", "create", tag, "--title", "Pi Archive", "--notes", "Archived pi shards", "--latest=false"], check=False)
+              subprocess.run(["gh", "release", "upload", tag, str(tar_path), "--clobber"], check=True)
+              # Remove local shards after upload
+              for g in group:
+                  import shutil
+                  shutil.rmtree(g)
+              tar_path.unlink()
+          PY
+
+      - name: Commit and push
+        run: |
+          git add state/ pi_data/
+          if git diff --cached --quiet; then
+            echo "No changes"
+            exit 0
           fi
+          total=$(cat state/index.json | python -c "import json,sys; print(json.load(sys.stdin)['total_digits'])")
+          git commit -m "pi: ${total} digits"
+          git pull --rebase
+          git push
 
-      - name: Commit
-        run: |
-          git add state/index.json state/progress.json
-          git add pi_data/[0-9][0-9][0-9]/*.txt 2>/dev/null || true
-          git add -A pi_data/ state/
-          git pull --rebase --autostash origin main || true
-          git commit -m "pi: $(cat state/index.json | jq -c .) shards=$(ls -1d pi_data/[0-9][0-9][0-9] 2>/dev/null | wc -l)" || true
-          git push || true
-
-      - name: Trigger next
-        if: always()
+      - name: Trigger next workflow
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python -c "
-          import json,datetime,pathlib
-          p=pathlib.Path('state/progress.json')
-          d=json.loads(p.read_text())
-          d['status']='waiting_next'
-          d['last_updated']=datetime.datetime.now(datetime.timezone.utc).isoformat()
-          p.write_text(json.dumps(d,indent=2))
-          "
-          git add state/progress.json
-          git pull --rebase --autostash origin main || true
-          git commit -m "progress: waiting_next" || true
-          git push || true
           gh workflow run pi-compute.yml || gh workflow run pi-compute-infinite.yml || true
