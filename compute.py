@@ -1,7 +1,7 @@
 from pathlib import Path
 import json, subprocess, os, shutil, sys
 
-CHUNK_COMPUTE = 50_000_000  # 50M
+CHUNK_COMPUTE = 50_000_000
 CHUNK_SAVE = 100_000
 FILES_PER_SHARD = 100
 DATA_DIR = Path("pi_data")
@@ -21,7 +21,6 @@ def ensure_ycruncher():
     if b: return b
     url = "https://github.com/Mysticial/y-cruncher/releases/download/v0.8.7.9547/y-cruncher.v0.8.7.9547-static.tar.xz"
     dl = Path("dl.tar.xz")
-    log(f"Downloading y-cruncher")
     subprocess.run(["curl","-L","-o",str(dl),url], check=True)
     subprocess.run(["tar","-xJf",str(dl)], check=True)
     dl.unlink(missing_ok=True)
@@ -33,76 +32,86 @@ def ensure_ycruncher():
         p.chmod(0o755)
     return find_bin()
 
+def extract_new_digits(pi_file: Path, total: int, need: int) -> str:
+    """9.5GBの整形済みy-cruncher出力をストリーミングで50Mだけ抜く"""
+    log(f"Streaming {pi_file.stat().st_size/1e9:.2f} GB file...")
+    collected = []
+    collected_len = 0
+    scanned_len = 0
+    
+    with pi_file.open("r", encoding="utf-8", errors="ignore", buffering=1024*1024) as f:
+        for line in f:
+            if ":" not in line:
+                continue
+            # "4124606720 884879... :  9550000000" の左側だけが数字
+            left = line.split(":")[0]
+            digits = left.replace(" ", "").strip()
+            if not digits:
+                continue
+            if scanned_len == 0 and digits.startswith("3."):
+                digits = digits[2:]
+            
+            if scanned_len + len(digits) <= total:
+                scanned_len += len(digits)
+                continue
+            
+            # ここから必要
+            start_in_line = max(0, total - scanned_len)
+            chunk = digits[start_in_line:]
+            
+            take = min(len(chunk), need - collected_len)
+            if take > 0:
+                collected.append(chunk[:take])
+                collected_len += take
+            
+            scanned_len += len(digits)
+            
+            if collected_len >= need:
+                break
+    
+    result = "".join(collected)
+    log(f"Extracted {len(result):,} digits (scanned {scanned_len:,})")
+    return result[:need]
+
 def main():
-    DATA_DIR.mkdir(exist_ok=True)
-    STATE_DIR.mkdir(exist_ok=True)
-    
-    idx_path = STATE_DIR / "index.json"
-    prog_path = STATE_DIR / "progress.json"
-    
-    if not idx_path.exists():
-        idx_path.write_text('{"total_digits":0}')
-    total = json.loads(idx_path.read_text())["total_digits"]
+    DATA_DIR.mkdir(exist_ok=True); STATE_DIR.mkdir(exist_ok=True)
+    idx = STATE_DIR/"index.json"
+    if not idx.exists(): idx.write_text('{"total_digits":0}')
+    total = json.loads(idx.read_text())["total_digits"]
     next_total = total + CHUNK_COMPUTE
-    
-    log(f"Computing {total:,} -> {next_total:,} digits")
+    log(f"{total:,} -> {next_total:,}")
 
     y_bin = ensure_ycruncher()
-    if not y_bin:
-        log("y-cruncher binary not found")
-        sys.exit(1)
-
-    work = STATE_DIR / "_work"
+    work = STATE_DIR/"_work"
     if work.exists(): shutil.rmtree(work)
-    work.mkdir(exist_ok=True)
-    
-    # Copy Binaries
-    if (YCRUNCHER_DIR / "Binaries").exists():
-        shutil.copytree(YCRUNCHER_DIR / "Binaries", work / "Binaries", dirs_exist_ok=True)
+    work.mkdir()
+    if (YCRUNCHER_DIR/"Binaries").exists():
+        shutil.copytree(YCRUNCHER_DIR/"Binaries", work/"Binaries", dirs_exist_ok=True)
 
-    # 15GB + Swap mode for >1.5B
-    if next_total > 1_500_000_000:
-        cmd = [str(y_bin), "skip-warnings", "custom", "pi", f"-dec:{next_total}", "-hex:0",
-               "-mode:swap", "-M:15g", "-swap:default", "-minIO:4m"]
-        log("Mode: SWAP -M:15g")
-    else:
-        cmd = [str(y_bin), "skip-warnings", "custom", "pi", f"-dec:{next_total}", "-hex:0",
-               "-M:15g"]
-        log("Mode: RAM -M:15g")
-
+    cmd = [str(y_bin), "skip-warnings", "custom", "pi", f"-dec:{next_total}", "-hex:0",
+           "-mode:swap", "-M:15g", "-swap:default", "-minIO:4m"]
     subprocess.run(cmd, cwd=work, check=True)
 
-    # Find output txt
-    cands = [p for p in work.glob("*.txt") if p.stat().st_size > 1_000_000]
-    if not cands:
-        cands = [p for p in work.rglob("*.txt") if p.stat().st_size > 1_000_000]
+    cands = [p for p in work.rglob("*.txt") if p.stat().st_size > 1_000_000]
     pi_file = sorted(cands, key=lambda x: x.stat().st_size, reverse=True)[0]
-    log(f"Found output: {pi_file} {pi_file.stat().st_size} bytes")
+    log(f"Found {pi_file} {pi_file.stat().st_size/1e9:.2f} GB")
 
-    raw = pi_file.read_text()
-    clean = raw.replace("\n","").replace(" ","").replace("\r","")
-    if clean.startswith("3."):
-        clean = clean[2:]
-    clean = clean[:next_total]
-    log(f"Clean length: {len(clean):,}")
-
-    # Save shards
-    for i in range(total, next_total, CHUNK_SAVE):
-        shard = (i // CHUNK_SAVE) // FILES_PER_SHARD
-        sd = DATA_DIR / f"{shard:03d}"
-        sd.mkdir(parents=True, exist_ok=True)
-        dest = sd / f"pi_{i:08d}-{i+CHUNK_SAVE-1:08d}.txt"
-        if not dest.exists():
-            dest.write_text(clean[i:i+CHUNK_SAVE])
-
-    # Progress
-    prog_path.write_text(json.dumps({
-        "total_digits": next_total,
-        "last_shard": f"{(next_total // CHUNK_SAVE -1)//FILES_PER_SHARD:03d}"
-    }, indent=2))
+    # ★ ここが修正: 9.5GBを全部読まない
+    clean = extract_new_digits(pi_file, total, CHUNK_COMPUTE)
     
+    # 即削除してRAM/ディスク空ける
     shutil.rmtree(work, ignore_errors=True)
-    idx_path.write_text(json.dumps({"total_digits": next_total}, indent=2))
+    
+    for i in range(total, next_total, CHUNK_SAVE):
+        shard = (i//CHUNK_SAVE)//FILES_PER_SHARD
+        sd = DATA_DIR/f"{shard:03d}"; sd.mkdir(parents=True, exist_ok=True)
+        dest = sd/f"pi_{i:08d}-{i+CHUNK_SAVE-1:08d}.txt"
+        offset = i - total
+        if not dest.exists():
+            dest.write_text(clean[offset:offset+CHUNK_SAVE])
+    
+    idx.write_text(json.dumps({"total_digits": next_total}, indent=2))
+    (STATE_DIR/"progress.json").write_text(json.dumps({"total_digits": next_total}, indent=2))
     log(f"Done {next_total:,}")
 
 if __name__ == "__main__":
